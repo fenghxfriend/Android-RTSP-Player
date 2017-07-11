@@ -1,0 +1,518 @@
+#include "GMVideoRTSPClient.h"
+#include "../Controller/GMVideoController.h"
+#include "../H264MediaSink/GMH264MediaSink.h"
+#include "../../../../source/GVideoRecorder/GVideoRecorder.h"
+#include "../../../../source/GFramework.h"
+
+#define GMVideo_RTSPCHKTEARDOWN 	50000
+#define GMVideo_RTSPCHKAUDIOENABLE 	50000
+
+void GMRTSPVideoContinueAfterDESCRIBE 	(class RTSPClient  *client, int resultCode, char *resultString, void *clientData);
+void GMRTSPVideoContinueAfterSETUP    	(class RTSPClient  *client, int resultCode, char *resultString, void *clientData);
+void GMRTSPVideoContinueAfterPLAY     	(class RTSPClient  *client, int resultCode, char *resultString, void *clientData);
+void GMRTSPVideoSetupNextSession      	(GMVideoRTSPClient *rtsp);
+void GMRTSPVideoSubsessionAfterPlaying	(void *clientData);
+void GMRTSPVideoSubsessionAfterBye    	(void *clientData);
+void GMRTSPVideoTearDownTask          	(void *clientData);
+void GMRTSPMediaSinkStopCall			(void *clientData, bool video);
+void GMRTSPVideoAudioEnableTask			(void *clientData);
+GMVideoRTSPClient::GMVideoRTSPClient	() 	{ init				(); 			}
+GMVideoRTSPClient::~GMVideoRTSPClient	() 	{ destory			(); 			}
+void GMVideoRTSPClient::init			() 	{ mConfiger.init	(); 			}
+void GMVideoRTSPClient::destory			()	{  mConfiger.init	(); 			}
+bool GMVideoRTSPClient::isRunning		() 	{ return mConfiger.isRunning(); 	}
+bool GMVideoRTSPClient::isStopping		() 	{ return mConfiger.isStopping();	}
+void GMVideoRTSPClient::playCallback	()  { if ( mConfiger.m_startCallback ) ( mConfiger.m_startCallback )( mConfiger.m_startDelegate, true, true, NULL ); }
+
+void GMVideoRTSPClient::start( const char *address, const char *username, const char *password, GMFUN_MEDIA_EVENT onEvent, void *delegate )
+{
+	const char *fError = NULL;
+
+    do
+    {
+    	if ( address 			== NULL )
+    	{
+    		fError = "address is null";
+    		break;
+    	}
+    	if ( strlen( address ) 	<= 0 	)
+    	{
+    		fError = "address.length is 0";
+    		break;
+    	}
+    	if ( mConfiger.isRunning()    )
+    	{
+    		fError = "I'm running now";
+    		break;
+    	}
+        if ( mConfiger.isStopping()   )
+    	{
+        	fError = "I'm stopping now";
+    		break;
+    	}
+
+        mConfiger.init();
+
+        mConfiger.m_URL				= address;
+        mConfiger.m_startCallback 	= onEvent;
+        mConfiger.m_startDelegate	= delegate;
+        if ( username != NULL && password != NULL && strlen( username ) > 0 && strlen( password ) > 0 )
+        	mConfiger.m_authenticator  = new Authenticator( username, password );
+
+        mConfiger.m_taskScheduler	= BasicTaskScheduler::createNew();
+        if ( !mConfiger.m_taskScheduler     )
+        {
+        	fError = "create schedule failed";
+    		break;
+        }
+
+        mConfiger.m_usageEnvironment    = BasicUsageEnvironment::createNew(*(mConfiger.m_taskScheduler));
+        if ( !mConfiger.m_usageEnvironment  )
+        {
+        	fError = "create environment failed";
+    		break;
+        }
+
+        mConfiger.m_RTSPClient          = RTSPClient::createNew(*(mConfiger.m_usageEnvironment), mConfiger.m_URL.c_str(), 0, "GMVideoRTSPClient");
+        if ( !mConfiger.m_RTSPClient        )
+        {
+        	fError = "create instance failed";
+    		break;
+        }
+
+        mConfiger.m_tearDownTask    	= ( mConfiger.m_usageEnvironment )->taskScheduler().scheduleDelayedTask( GMVideo_RTSPCHKTEARDOWN	, GMRTSPVideoTearDownTask	, this );
+        mConfiger.m_audioEnableTask		= ( mConfiger.m_usageEnvironment )->taskScheduler().scheduleDelayedTask( GMVideo_RTSPCHKAUDIOENABLE	, GMRTSPVideoAudioEnableTask, this );
+
+        mConfiger.setRunning ( true  );
+        mConfiger.setStopping( false );
+
+        ( mConfiger.m_RTSPClient )->sendDescribeCommand( GMRTSPVideoContinueAfterDESCRIBE, mConfiger.m_authenticator );
+
+        ( mConfiger.m_usageEnvironment )->taskScheduler().doEventLoop( &( mConfiger.m_RTSPExit ) );
+
+        ( mConfiger.m_usageEnvironment )->reclaim();
+
+        mConfiger.setStopping( false );
+        mConfiger.setRunning ( false );
+
+    } while ( 0 );
+
+    if ( mConfiger.m_taskScheduler ) delete mConfiger.m_taskScheduler;
+    if ( mConfiger.m_authenticator ) delete mConfiger.m_authenticator;
+
+    if 		( fError != NULL && onEvent != NULL )
+    {
+#if	DO_DEBUG
+        printf( "RTSP >> start( ... ) >> ERROR >> %s \n", fError );
+#endif
+    	onEvent( delegate, true, false, fError );
+    }
+    else if ( strlen( mConfiger.m_startError ) > 0 && onEvent != NULL )
+    {
+#if	DO_DEBUG
+        printf( "RTSP >> start( ... ) >> ERROR MSG >> %s \n", mConfiger.m_startError );
+#endif
+    	onEvent( delegate, true, false, mConfiger.m_startError );
+    }
+    else if ( mConfiger.m_stopCallback != NULL )
+    {
+#if	DO_DEBUG
+        printf( "RTSP >> start( ... ) >> stop success \n" );
+#endif
+    	( mConfiger.m_stopCallback )( mConfiger.m_stopDelegate, false, true, NULL );
+    }
+
+    mConfiger.init();
+}
+
+void GMVideoRTSPClient::stop( GMFUN_MEDIA_EVENT onEvent, void *delegate )
+{
+	const char *fError = NULL;
+
+	do
+	{
+		if ( !mConfiger.isRunning() )
+		{
+			fError = "I'm stopped";
+			break;
+		}
+        if ( mConfiger.isStopping()   )
+    	{
+        	fError = "I'm stopping";
+    		break;
+    	}
+
+        mConfiger.m_stopCallback = onEvent;
+        mConfiger.m_stopDelegate = delegate;
+
+#if DO_DEBUG
+		printf( "mediaStop() >> 001 >> 001\n" );
+#endif
+        mConfiger.setStopping( true );
+
+	} while ( 0 );
+
+	if ( fError != NULL && onEvent != NULL )
+	{
+#if	DO_DEBUG
+        printf( "RTSP >> stop( ... ) >> ERROR >> %s \n", fError );
+#endif
+        onEvent( delegate, false, false, fError );
+	}
+}
+
+bool GMVideoRTSPClient::supportAudio()
+{
+	bool fResult = false;
+
+	do
+	{
+		if ( !mConfiger.isRunning()  ) break;
+		if (  mConfiger.isStopping() ) break;
+
+		fResult = mConfiger.supportAudio();
+
+	} while( false );
+
+	return fResult;
+}
+
+void GMVideoRTSPClient::audioEnable( bool enable, GMFUN_MEDIA_EVENT onEvent, void *delegate )
+{
+	const char *fError = NULL;
+
+	do
+	{
+		if ( !mConfiger.isRunning() )
+		{
+			fError = "I'm stopped";
+			break;
+		}
+        if ( mConfiger.isStopping()   )
+    	{
+        	fError = "I'm stopping";
+    		break;
+    	}
+        if ( !supportAudio()   )
+    	{
+        	fError = "audio does not support";
+    		break;
+    	}
+
+        mConfiger.setAudioEnable( onEvent, delegate, enable );
+
+	} while ( false );
+
+    if ( fError != NULL && onEvent != NULL )
+    {
+#if	DO_DEBUG
+        printf( "RTSP >> audioEnable( ... ) >> ERROR >> %s \n", fError );
+#endif
+    	onEvent( delegate, enable, false, fError );
+    }
+}
+
+void GMRTSPVideoContinueAfterDESCRIBE(class RTSPClient *client, int resultCode, char *resultString, void *clientData)
+{
+    do
+    {
+        GMVideoRTSPClient   &RTSPRef        = GMVideoController::sharedInstance().RTSPClientInstance();
+        UsageEnvironment    *environment    = RTSPRef.mConfiger.m_usageEnvironment;
+        MediaSession*       &mediaSession   = RTSPRef.mConfiger.m_mediaSession;
+
+        if (resultCode != 0)
+        {
+        	sprintf( RTSPRef.mConfiger.m_startError, "%s >> %s", "DESCRIBE", ( resultString != NULL ? resultString : "null" ) );
+            RTSPRef.stop( NULL, NULL );
+            break;
+        }
+
+        mediaSession = MediaSession::createNew(*environment, resultString);
+        delete[] resultString;
+
+        if (mediaSession == NULL || !mediaSession->hasSubsessions())
+        {
+        	sprintf( RTSPRef.mConfiger.m_startError, "%s", "mediaSession error" );
+            RTSPRef.stop( NULL, NULL );
+            break;
+        }
+
+        RTSPRef.mConfiger.m_mediaSubsessionIterator = new MediaSubsessionIterator(*mediaSession);
+        GMRTSPVideoSetupNextSession(&RTSPRef);
+
+    } while (0);
+}
+
+void GMRTSPVideoSetupNextSession(GMVideoRTSPClient *rtsp)
+{
+    GMVideoRTSPClient   &RTSPRef            = *rtsp;
+    MediaSession*       &mediaSession       = RTSPRef.mConfiger.m_mediaSession;
+    MediaSubsession*    &mediaSubsession    = RTSPRef.mConfiger.m_mediaSubsession;
+
+    mediaSubsession                         = (RTSPRef.mConfiger.m_mediaSubsessionIterator)->next();
+    if (mediaSubsession != NULL)
+    {
+        if (mediaSubsession->initiate())
+        {
+            (RTSPRef.mConfiger.m_RTSPClient)->sendSetupCommand(*mediaSubsession, GMRTSPVideoContinueAfterSETUP, NULL, false, false/*true*/, false, RTSPRef.mConfiger.m_authenticator);
+        }
+        else
+        {
+            GMRTSPVideoSetupNextSession(&RTSPRef);
+        }
+
+        return;
+    }
+
+    (RTSPRef.mConfiger.m_RTSPClient)->sendPlayCommand(*mediaSession, GMRTSPVideoContinueAfterPLAY, NULL, 0.0f, -1.0f, 1.0f, RTSPRef.mConfiger.m_authenticator);
+}
+
+void GMRTSPVideoContinueAfterSETUP(class RTSPClient *client, int resultCode, char *resultString, void *clientData)
+{
+    GMVideoRTSPClient   &RTSPRef           = GMVideoController::sharedInstance().RTSPClientInstance();
+    UsageEnvironment    *environment       = RTSPRef.mConfiger.m_usageEnvironment;
+    MediaSubsession*    &mediaSubsession   = RTSPRef.mConfiger.m_mediaSubsession;
+
+    do
+    {
+#if	DO_DEBUG
+        printf( "RTSP >> SETUP >> Name = %s Code = %d Message = %s \n", mediaSubsession->mediumName(), resultCode, ( resultString != NULL ? resultString : "null" ) );
+#endif
+
+        if (resultCode != 0)
+        {
+        	sprintf( RTSPRef.mConfiger.m_startError, "%s >> %s", "SETUP", ( resultString != NULL ? resultString : "null" ) );
+            break;
+        }
+
+        if 		( strcmp( mediaSubsession->mediumName(), "video" ) == 0 )
+        {
+#if	DO_DEBUG
+        printf( "RTSP >> SETUP >> video \n" );
+#endif
+            mediaSubsession->sink = GMH264MediaSink::createNew( *environment, &RTSPRef, (void *)GMRTSPMediaSinkStopCall );
+        }
+        else if ( strcmp( mediaSubsession->mediumName(), "audio" ) == 0 )
+        {
+#if	DO_DEBUG
+        printf( "RTSP >> SETUP >> audio \n" );
+#endif
+            mediaSubsession->sink = GMPCMMediaSink::createNew ( *environment, &RTSPRef, (void *)GMRTSPMediaSinkStopCall );
+        }
+        if ( mediaSubsession->sink == NULL )
+        {
+        	sprintf( RTSPRef.mConfiger.m_startError, "%s >> create %s session failed", "SETUP", mediaSubsession->mediumName() );
+        	break;
+        }
+        if 		( strcmp( mediaSubsession->mediumName(), "video" ) == 0 )
+        {
+        	RTSPRef.mConfiger.m_H264MediaSink = ( GMH264MediaSink * )( mediaSubsession->sink );
+        }
+        else if ( strcmp( mediaSubsession->mediumName(), "audio" ) == 0 )
+        {
+        	RTSPRef.mConfiger.m_PCMMediaSink = ( GMPCMMediaSink * )( mediaSubsession->sink );
+        }
+        mediaSubsession->miscPtr = &RTSPRef;
+
+        mediaSubsession->sink->startPlaying(*(mediaSubsession->readSource()), GMRTSPVideoSubsessionAfterPlaying, mediaSubsession);
+
+        if ( !mediaSubsession->rtcpInstance() ) break;
+
+        mediaSubsession->rtcpInstance()->setByeHandler(GMRTSPVideoSubsessionAfterBye, mediaSubsession);
+
+    } while (0);
+
+    GMRTSPVideoSetupNextSession(&RTSPRef);
+}
+
+void GMRTSPVideoContinueAfterPLAY(class RTSPClient *client, int resultCode, char *resultString, void *clientData)
+{
+    do
+    {
+        GMVideoRTSPClient &RTSPRef = GMVideoController::sharedInstance().RTSPClientInstance();
+
+        if (resultCode != 0)
+        {
+        	printf( "@@@@@@@@@@@@@@@@@@@@@@@@@@@@XXXXXXXXXXXXXX \n" );
+        	sprintf( RTSPRef.mConfiger.m_startError, "%s >> %s", "PLAY", ( resultString != NULL ? resultString : "null" ) );
+            RTSPRef.stop( NULL, NULL );
+            break;
+        }
+
+#if	DO_DEBUG
+        printf( "RTSP >> PLAY >> success \n" );
+#endif
+
+        //RTSPRef.playCallback();
+
+    } while (0);
+}
+
+void GMRTSPVideoSubsessionAfterPlaying(void* clientData)
+{
+    MediaSubsession*    currentSubsession  = (MediaSubsession*)clientData;
+    GMVideoRTSPClient   &RTSPRef           = *((GMVideoRTSPClient *)(currentSubsession->miscPtr));
+    MediaSession*       &mediaSession      = RTSPRef.mConfiger.m_mediaSession;
+
+    do
+    {
+        if ( currentSubsession->rtcpInstance() != NULL )
+        {
+        	currentSubsession->rtcpInstance()->setByeHandler(NULL, NULL);
+        }
+        Medium::close(currentSubsession->sink);
+        currentSubsession->sink = NULL;
+
+        bool allSubsessionClosed = true;
+        MediaSubsession* subsession;
+        MediaSubsessionIterator iter(*mediaSession);
+        while ( (subsession = iter.next()) )
+        {
+            if (subsession->sink != NULL)
+            {
+                allSubsessionClosed = false;
+                break;
+            }
+        }
+        if (!allSubsessionClosed)
+        {
+            break;
+        }
+
+        RTSPRef.stop( NULL, NULL );
+
+    } while (0);
+}
+
+void GMRTSPVideoSubsessionAfterBye(void *clientData)
+{
+    GMRTSPVideoSubsessionAfterPlaying(clientData);
+}
+
+void GMRTSPVideoTearDownTask(void *clientData)
+{
+    GMVideoRTSPClient &RTSPRef = *((GMVideoRTSPClient *)clientData);
+
+    if ( !RTSPRef.mConfiger.isStopping() )
+    {
+        (RTSPRef.mConfiger.m_usageEnvironment)->taskScheduler().rescheduleDelayedTask(RTSPRef.mConfiger.m_tearDownTask, GMVideo_RTSPCHKTEARDOWN, GMRTSPVideoTearDownTask, clientData);
+    }
+    else
+    {
+#if DO_DEBUG
+		printf( "mediaStop() >> 001 >> 002   XXX\n" );
+#endif
+        RTSPRef.closeMediaSink();
+#if DO_DEBUG
+		printf( "mediaStop() >> 001 >> 003\n" );
+#endif
+    }
+}
+
+void GMRTSPVideoAudioEnableTask(void *clientData)
+{
+    GMVideoRTSPClient  &RTSPRef 	= *((GMVideoRTSPClient *)clientData);
+    GMFUN_MEDIA_EVENT  	fEvent  	= NULL;
+    void *				fDelegate	= NULL;
+    bool				fEnable		= false;
+    bool				fContinue	= false;
+
+    do
+    {
+    	if ( !RTSPRef.supportAudio() ) break;
+
+    	fContinue = true;
+
+    	RTSPRef.mConfiger.getAudioEnable( &fEvent, &fDelegate, &fEnable );
+
+    	if ( fEvent == NULL ) break;
+
+    	RTSPRef.mConfiger.setAudioEnable			( NULL, NULL, false );
+    	( RTSPRef.mConfiger.m_PCMMediaSink )->pause	( !fEnable );
+
+    	fEvent( fDelegate, fEnable, true, NULL );
+
+    } while ( false );
+
+    if ( fContinue )
+    	(RTSPRef.mConfiger.m_usageEnvironment)->taskScheduler().rescheduleDelayedTask(RTSPRef.mConfiger.m_audioEnableTask, GMVideo_RTSPCHKAUDIOENABLE, GMRTSPVideoAudioEnableTask, clientData);
+}
+
+void GMVideoRTSPClient::closeMediaSink()
+{
+    if ( mConfiger.m_H264MediaSink != NULL )
+    {
+        (mConfiger.m_H264MediaSink)->stop();
+    }
+    if ( mConfiger.m_PCMMediaSink != NULL )
+    {
+        (mConfiger.m_PCMMediaSink)->stop();
+    }
+
+    if ( mConfiger.m_H264MediaSink == NULL && mConfiger.m_PCMMediaSink == NULL )
+    {
+        closeStream();
+    }
+}
+
+void GMRTSPMediaSinkStopCall(void *clientData, bool video)
+{
+    GMVideoRTSPClient &RTSPRef = *((GMVideoRTSPClient *)clientData);
+    if ( video )
+    	RTSPRef.mConfiger.m_H264MediaSink = NULL;
+    else
+    	RTSPRef.mConfiger.m_PCMMediaSink  = NULL;
+
+    if ( RTSPRef.mConfiger.m_H264MediaSink == NULL && RTSPRef.mConfiger.m_PCMMediaSink == NULL )
+    {
+    	RTSPRef.closeStream();
+    }
+}
+
+void GMVideoRTSPClient::closeStream()
+{
+    if (mConfiger.m_tearDownTask)
+    	(mConfiger.m_usageEnvironment)->taskScheduler().unscheduleDelayedTask(mConfiger.m_tearDownTask);
+    if (mConfiger.m_audioEnableTask)
+    	(mConfiger.m_usageEnvironment)->taskScheduler().unscheduleDelayedTask(mConfiger.m_audioEnableTask);
+
+    bool haveLiveSubsession = false;
+    if (mConfiger.m_mediaSession != NULL)
+    {
+        MediaSubsession* subsession;
+        MediaSubsessionIterator iter(*(mConfiger.m_mediaSession));
+        while ((subsession = iter.next()) != NULL)
+        {
+            if (subsession->sink != NULL)
+            {
+                if (subsession->rtcpInstance() != NULL)
+                {
+                    subsession->rtcpInstance()->setByeHandler(NULL, NULL);
+                }
+                Medium::close(subsession->sink);
+                subsession->sink = NULL;
+
+                haveLiveSubsession = true;
+            }
+        }
+
+        if (haveLiveSubsession)
+        {
+            (mConfiger.m_RTSPClient)->sendTeardownCommand(*(mConfiger.m_mediaSession), NULL, mConfiger.m_authenticator);
+        }
+    }
+
+    if (mConfiger.m_mediaSubsessionIterator != NULL)
+    {
+        delete mConfiger.m_mediaSubsessionIterator;
+    }
+
+    if (mConfiger.m_mediaSession != NULL)
+    {
+        Medium::close(mConfiger.m_mediaSession);
+    }
+
+    Medium::close(mConfiger.m_RTSPClient);
+    mConfiger.m_RTSPExit = 1;
+}
+
